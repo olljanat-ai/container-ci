@@ -1,0 +1,100 @@
+###############################################################################
+# Copy to terraform.tfvars (git-ignored) and edit.
+###############################################################################
+
+registry_name       = "contosocentralregistry" # must be globally unique, alphanumeric only
+resource_group_name = "rg-container-registry"
+location            = "westeurope"
+
+tags = {
+  owner       = "platform-team"
+  environment = "shared"
+}
+
+# Optional: replicate to a second region so pulls are served locally.
+geo_replications = [
+  { location = "northeurope" },
+]
+
+# Optional: forward login and repository events to Log Analytics.
+# log_analytics_workspace_resource_id = "/subscriptions/.../resourceGroups/rg-logs/providers/Microsoft.OperationalInsights/workspaces/law-platform"
+
+###############################################################################
+# Tenants
+#
+# Each tenant owns the repository namespace named after it unless you override
+# `repository_namespaces`. Tenants can always read `shared/` and `cache/`
+# (see var.shared_read_namespaces) but can only write inside their own prefixes.
+###############################################################################
+tenants = {
+
+  # A project built on GitHub Actions. The pipeline gets its own managed
+  # identity and authenticates with OIDC, so no secret is stored in GitHub.
+  payments = {
+    display_name = "Payments platform"
+
+    ci_identities = {
+      # Subject must match the token GitHub issues. Common forms:
+      #   repo:<owner>/<repo>:ref:refs/heads/main
+      #   repo:<owner>/<repo>:environment:production
+      #   repo:<owner>/<repo>:pull_request
+      build = {
+        access  = "push"
+        issuer  = "https://token.actions.githubusercontent.com"
+        subject = "repo:contoso/payments-api:ref:refs/heads/main"
+      }
+    }
+
+    principals = {
+      # The AKS cluster that runs the workload only needs to pull.
+      aks_prod = {
+        object_id      = "00000000-0000-0000-0000-000000000000" # kubelet identity principal ID
+        access         = "pull"
+        principal_type = "ServicePrincipal"
+        description    = "aks-prod kubelet pulls payments images"
+      }
+    }
+  }
+
+  # A project on GitLab CI that also needs to delete old tags.
+  web = {
+    display_name          = "Web frontend"
+    repository_namespaces = ["web/"]
+
+    ci_identities = {
+      # GitLab SaaS issuer is https://gitlab.com; self-managed is your instance URL.
+      build = {
+        access  = "push"
+        issuer  = "https://gitlab.com"
+        subject = "project_path:contoso/web:ref_type:branch:ref:main"
+      }
+      retention = {
+        access  = "contribute"
+        issuer  = "https://gitlab.com"
+        subject = "project_path:contoso/web:ref_type:branch:ref:main"
+      }
+    }
+  }
+
+  # A project on Azure DevOps. The subject comes from the workload identity
+  # federation service connection Azure DevOps creates for you.
+  reporting = {
+    display_name = "Reporting"
+
+    ci_identities = {
+      build = {
+        access  = "push"
+        issuer  = "https://vstoken.dev.azure.com/00000000-0000-0000-0000-000000000000"
+        subject = "sc://contoso/Reporting/acr-push"
+      }
+    }
+
+    # A runner that cannot federate falls back to a repository-scoped token.
+    # ACR scope maps need full repository names, not prefixes.
+    token = {
+      access          = "pull"
+      repositories    = ["reporting/etl"]
+      password_expiry = "2027-01-01T00:00:00Z"
+    }
+  }
+}
