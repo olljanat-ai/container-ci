@@ -49,6 +49,9 @@ which lists every file each one appears in.
 | `docker/metadata-action` | v6.2.0 | `dc802804100637a589fabce1cb79ff13a1411302` |
 | `github/codeql-action` | v4.37.9 | `cdf488f595d80d6e07e03d4674febd5ab45fa938` |
 | `actions/upload-artifact` | v7.0.1 | `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` |
+| `actions/configure-pages` | v6.0.0 | `45bfe0192ca1faeb007ade9deae92b16b8254a0d` |
+| `actions/upload-pages-artifact` | v5.0.0 | `fc324d3547104276b827a68afc52ff2a11cc49c9` |
+| `actions/deploy-pages` | v5.0.1 | `368f82528645a54fb793d4d04e342629a3f51346` |
 
 Resolve a tag to a SHA with:
 
@@ -186,6 +189,7 @@ incomplete.
 | Registry configuration | `infra/terraform/variables.tf` + `main.tf`, `infra/terraform/README.md`, the "Deliberate choices" table in `docs/index.template.html` |
 | A new CI platform | see [`playbooks/add-pipeline-platform.md`](playbooks/add-pipeline-platform.md) — 8 places |
 | Anything included by the site | re-run `python3 tools/build_docs.py` |
+| The site's publishing setup | `.github/workflows/pages.yml`, `docs/README.md`, `README.md`, `ai/playbooks/update-docs-site.md` |
 
 `{{include:…}}` in `docs/index.template.html` currently pulls:
 
