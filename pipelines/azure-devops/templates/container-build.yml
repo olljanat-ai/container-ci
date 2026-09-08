@@ -1,0 +1,276 @@
+###############################################################################
+# Azure DevOps template: build a Dockerfile, scan it, push it to the central ACR.
+#
+# Publish this repository as a pipeline resource and extend the template from a
+# project pipeline - see ../azure-pipelines.yml for a complete example.
+#
+# Order of operations: scan the source, build, scan the image, and only then
+# push. A vulnerable image never reaches the shared registry.
+###############################################################################
+
+parameters:
+  - name: registry
+    type: string
+    # Registry login server, e.g. contosocentralregistry.azurecr.io
+
+  - name: image
+    type: string
+    # Repository inside the registry. Must start with your tenant's namespace,
+    # e.g. payments/api. Pushing outside it is denied by the ABAC condition on
+    # the pipeline identity.
+
+  - name: azureServiceConnection
+    type: string
+    # Name of an ARM service connection configured for workload identity
+    # federation, backed by the tenant's managed identity.
+
+  - name: dockerfile
+    type: string
+    default: Dockerfile
+
+  - name: buildContext
+    type: string
+    default: .
+
+  - name: buildArgs
+    type: string
+    default: ""
+    # Extra build arguments, one KEY=VALUE per line.
+
+  - name: defaultBranch
+    type: string
+    default: refs/heads/main
+    # Builds of this branch also get the moving `latest` tag.
+
+  - name: push
+    type: boolean
+    default: true
+
+  - name: trivyConfig
+    type: string
+    default: trivy.yaml
+
+  - name: trivySeverity
+    type: string
+    default: HIGH,CRITICAL
+
+  - name: trivyVersion
+    type: string
+    default: "0.74.0"
+
+  - name: safeChainVersion
+    type: string
+    default: "1.5.18"
+
+  - name: safeChainSha256
+    type: string
+    default: bdbc58829853e598c09874fcc193f7cdb2a9a848875be45260a8b59bc4ce5439
+
+  - name: poolVmImage
+    type: string
+    default: ubuntu-latest
+
+jobs:
+  - job: build_scan_push
+    displayName: Build, scan and push
+
+    pool:
+      vmImage: ${{ parameters.poolVmImage }}
+
+    variables:
+      # Immutable, traceable tag. The branch tag below is the moving one.
+      imageTag: $(Build.SourceVersion)
+      imageRef: ${{ parameters.registry }}/${{ parameters.image }}
+      TRIVY_CACHE_DIR: $(Pipeline.Workspace)/.trivy-cache
+
+    steps:
+      - checkout: self
+        fetchDepth: 1
+        persistCredentials: false
+
+      # -------------------------------------------------------------------
+      # Supply chain: block malicious packages before they are installed.
+      #
+      # This covers what the *pipeline* installs. Dependencies installed
+      # inside `docker build` are covered by installing Safe Chain in the
+      # Dockerfile's build stage - see pipelines/common/Dockerfile.
+      # -------------------------------------------------------------------
+      - script: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/AikidoSec/safe-chain/releases/download/${SAFE_CHAIN_VERSION}/install-safe-chain.sh" -o /tmp/install-safe-chain.sh
+          echo "${SAFE_CHAIN_SHA256}  /tmp/install-safe-chain.sh" | sha256sum -c -
+          sh /tmp/install-safe-chain.sh --ci
+          rm /tmp/install-safe-chain.sh
+          echo "##vso[task.prependpath]$HOME/.safe-chain/shims"
+          echo "##vso[task.prependpath]$HOME/.safe-chain/bin"
+        displayName: Install Aikido Safe Chain
+        env:
+          SAFE_CHAIN_VERSION: ${{ parameters.safeChainVersion }}
+          SAFE_CHAIN_SHA256: ${{ parameters.safeChainSha256 }}
+
+      - script: safe-chain --version
+        displayName: Verify Safe Chain is on PATH
+
+      - task: Cache@2
+        displayName: Cache the Trivy database
+        inputs:
+          key: 'trivy | "$(Agent.OS)" | ${{ parameters.trivyVersion }}'
+          path: $(TRIVY_CACHE_DIR)
+
+      - script: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -o /tmp/trivy.tar.gz
+          tar -xzf /tmp/trivy.tar.gz -C /tmp trivy
+          sudo mv /tmp/trivy /usr/local/bin/trivy
+          rm -f /tmp/trivy.tar.gz
+          trivy --version
+        displayName: Install Trivy
+        env:
+          TRIVY_VERSION: ${{ parameters.trivyVersion }}
+
+      # -------------------------------------------------------------------
+      # Scan the source before anything is built: dependency CVEs from lock
+      # files, committed secrets, and Dockerfile misconfiguration.
+      #
+      # Two passes on purpose. The first produces a full-severity report for
+      # the build summary; the second is filtered to the severities that
+      # should actually block. The database is shared between them.
+      # -------------------------------------------------------------------
+      - script: |
+          set -euo pipefail
+          trivy fs --config "${TRIVY_CONFIG}" \
+            --format sarif --output "$(Build.ArtifactStagingDirectory)/trivy-source.sarif" \
+            --exit-code 0 \
+            "${BUILD_CONTEXT}"
+        displayName: "Trivy: scan source (report)"
+        env:
+          TRIVY_CONFIG: ${{ parameters.trivyConfig }}
+          BUILD_CONTEXT: ${{ parameters.buildContext }}
+
+      - script: |
+          set -euo pipefail
+          trivy fs --config "${TRIVY_CONFIG}" \
+            --severity "${TRIVY_SEVERITY}" \
+            --format table --exit-code 1 \
+            "${BUILD_CONTEXT}"
+        displayName: "Trivy: scan source (gate)"
+        env:
+          TRIVY_CONFIG: ${{ parameters.trivyConfig }}
+          TRIVY_SEVERITY: ${{ parameters.trivySeverity }}
+          BUILD_CONTEXT: ${{ parameters.buildContext }}
+
+      # -------------------------------------------------------------------
+      # Build. The image stays on the agent until the scan below passes.
+      # -------------------------------------------------------------------
+      - script: |
+          set -euo pipefail
+          args=(
+            --file "${DOCKERFILE}"
+            --tag "$(imageRef):$(imageTag)"
+            --build-arg "REGISTRY=${REGISTRY}"
+            --build-arg "SAFE_CHAIN_VERSION=${SAFE_CHAIN_VERSION}"
+            --build-arg "SAFE_CHAIN_SHA256=${SAFE_CHAIN_SHA256}"
+            --label "org.opencontainers.image.revision=$(Build.SourceVersion)"
+            --label "org.opencontainers.image.source=$(Build.Repository.Uri)"
+          )
+          while IFS= read -r build_arg; do
+            [ -n "${build_arg}" ] || continue
+            args+=(--build-arg "${build_arg}")
+          done <<< "${EXTRA_BUILD_ARGS}"
+          docker build "${args[@]}" "${BUILD_CONTEXT}"
+        displayName: Build image
+        env:
+          DOCKERFILE: ${{ parameters.dockerfile }}
+          BUILD_CONTEXT: ${{ parameters.buildContext }}
+          REGISTRY: ${{ parameters.registry }}
+          SAFE_CHAIN_VERSION: ${{ parameters.safeChainVersion }}
+          SAFE_CHAIN_SHA256: ${{ parameters.safeChainSha256 }}
+          EXTRA_BUILD_ARGS: ${{ parameters.buildArgs }}
+
+      # -------------------------------------------------------------------
+      # Scan the built image. This is the gate that keeps the shared registry
+      # clean: nothing is pushed until it passes.
+      # -------------------------------------------------------------------
+      - script: |
+          set -euo pipefail
+          trivy image --config "${TRIVY_CONFIG}" \
+            --format sarif --output "$(Build.ArtifactStagingDirectory)/trivy-image.sarif" \
+            --exit-code 0 \
+            "$(imageRef):$(imageTag)"
+        displayName: "Trivy: scan image (report)"
+        env:
+          TRIVY_CONFIG: ${{ parameters.trivyConfig }}
+
+      - script: |
+          set -euo pipefail
+          trivy image --config "${TRIVY_CONFIG}" \
+            --severity "${TRIVY_SEVERITY}" \
+            --format table --exit-code 1 \
+            "$(imageRef):$(imageTag)"
+        displayName: "Trivy: scan image (gate)"
+        env:
+          TRIVY_CONFIG: ${{ parameters.trivyConfig }}
+          TRIVY_SEVERITY: ${{ parameters.trivySeverity }}
+
+      - script: |
+          set -euo pipefail
+          trivy image --format cyclonedx \
+            --output "$(Build.ArtifactStagingDirectory)/sbom.cyclonedx.json" \
+            --exit-code 0 \
+            "$(imageRef):$(imageTag)"
+        displayName: "Trivy: generate SBOM"
+
+      - task: PublishBuildArtifacts@1
+        displayName: Publish scan results and SBOM
+        condition: always()
+        inputs:
+          PathtoPublish: $(Build.ArtifactStagingDirectory)
+          ArtifactName: container-scan
+
+      # -------------------------------------------------------------------
+      # Push. The service connection is federated to this project, so the
+      # agent holds no registry password.
+      # -------------------------------------------------------------------
+      - ${{ if parameters.push }}:
+          - task: AzureCLI@2
+            displayName: Sign in and push
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            inputs:
+              azureSubscription: ${{ parameters.azureServiceConnection }}
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                # The pipeline identity holds repository data-plane permissions
+                # only, so `az acr login` - which resolves the registry through
+                # ARM first - is not guaranteed to work. Exchange the Entra
+                # token for an ACR refresh token instead, which is the same
+                # exchange az performs internally.
+                tenant_id="$(az account show --query tenantId -o tsv)"
+                access_token="$(az account get-access-token \
+                  --resource https://containerregistry.azure.net \
+                  --query accessToken -o tsv)"
+                refresh_token="$(curl -sS --fail-with-body -X POST \
+                  "https://${REGISTRY}/oauth2/exchange" \
+                  -H "Content-Type: application/x-www-form-urlencoded" \
+                  --data-urlencode "grant_type=access_token" \
+                  --data-urlencode "service=${REGISTRY}" \
+                  --data-urlencode "tenant=${tenant_id}" \
+                  --data-urlencode "access_token=${access_token}" | jq -r '.refresh_token')"
+                printf '%s' "${refresh_token}" | docker login "${REGISTRY}" \
+                  --username 00000000-0000-0000-0000-000000000000 --password-stdin
+
+                docker push "$(imageRef):$(imageTag)"
+
+                # Moving tag for the default branch only. Every other build
+                # is addressable solely by its immutable commit tag.
+                if [ "$(Build.SourceBranch)" = "${DEFAULT_BRANCH}" ]; then
+                  docker tag "$(imageRef):$(imageTag)" "$(imageRef):latest"
+                  docker push "$(imageRef):latest"
+                fi
+
+                docker logout "${REGISTRY}"
+            env:
+              REGISTRY: ${{ parameters.registry }}
+              DEFAULT_BRANCH: ${{ parameters.defaultBranch }}

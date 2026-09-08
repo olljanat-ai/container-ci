@@ -1,0 +1,240 @@
+###############################################################################
+# GitLab CI template: build a Dockerfile, scan it, push it to the central ACR.
+#
+# Include it from a project's .gitlab-ci.yml - see ../.gitlab-ci.yml for a
+# complete example.
+#
+# Order of operations: scan the source, build, scan the image, and only then
+# push. A vulnerable image never reaches the shared registry.
+#
+# Two CI/CD variables must exist on the project or - better - on the group:
+#   AZURE_CLIENT_ID   client ID of the tenant's pipeline managed identity
+#   AZURE_TENANT_ID   Entra tenant ID
+# Both are identifiers rather than credentials, so they need neither masking
+# nor protection. They are read at job runtime rather than declared as spec
+# inputs, because `include:inputs` is resolved before CI/CD variables exist.
+###############################################################################
+
+spec:
+  inputs:
+    registry:
+      description: Registry login server, e.g. contosocentralregistry.azurecr.io
+    image:
+      description: >-
+        Repository inside the registry. Must start with your tenant's namespace,
+        e.g. payments/api. Pushing outside it is denied by the ABAC condition on
+        the pipeline identity.
+    dockerfile:
+      description: Path to the Dockerfile.
+      default: Dockerfile
+    build_context:
+      description: Build context passed to docker build.
+      default: "."
+    trivy_config:
+      description: Path to the shared Trivy policy.
+      default: trivy.yaml
+    trivy_severity:
+      description: Severities that fail the build.
+      default: HIGH,CRITICAL
+    trivy_version:
+      default: "0.74.0"
+    safe_chain_version:
+      default: "1.5.18"
+    safe_chain_sha256:
+      default: bdbc58829853e598c09874fcc193f7cdb2a9a848875be45260a8b59bc4ce5439
+    default_branch:
+      description: Builds of this branch also get the moving `latest` tag.
+      default: main
+    stage:
+      default: build
+
+---
+container:build:
+  stage: $[[ inputs.stage ]]
+
+  image: docker:28-cli
+  services:
+    - docker:28-dind
+
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: "/certs/client"
+    TRIVY_CACHE_DIR: .trivy-cache
+    REGISTRY: $[[ inputs.registry ]]
+    IMAGE_REF: $[[ inputs.registry ]]/$[[ inputs.image ]]
+    # Immutable, traceable tag. The branch tag below is the moving one.
+    IMAGE_TAG: $CI_COMMIT_SHA
+
+  id_tokens:
+    # GitLab mints this token for the job. The federated credential on the
+    # Azure side only accepts a token whose issuer and subject match, so
+    # another project cannot use this identity even knowing the client ID.
+    AZURE_ID_TOKEN:
+      aud: api://AzureADTokenExchange
+
+  cache:
+    key: trivy-$[[ inputs.trivy_version ]]
+    paths:
+      - .trivy-cache
+
+  before_script:
+    - apk add --no-cache bash curl jq tar
+
+    # ---------------------------------------------------------------------
+    # Supply chain: block malicious packages before they are installed.
+    #
+    # This covers what the *job* installs. Dependencies installed inside
+    # `docker build` are covered by installing Safe Chain in the Dockerfile's
+    # build stage - see pipelines/common/Dockerfile.
+    #
+    # GitLab runs every script line in the same shell, so exporting PATH here
+    # carries into `script`.
+    # ---------------------------------------------------------------------
+    - |
+      curl -fsSL "https://github.com/AikidoSec/safe-chain/releases/download/$[[ inputs.safe_chain_version ]]/install-safe-chain.sh" -o /tmp/install-safe-chain.sh
+      echo "$[[ inputs.safe_chain_sha256 ]]  /tmp/install-safe-chain.sh" | sha256sum -c -
+      sh /tmp/install-safe-chain.sh --ci
+      rm /tmp/install-safe-chain.sh
+      export PATH="$HOME/.safe-chain/shims:$HOME/.safe-chain/bin:$PATH"
+      safe-chain --version
+
+    # The tarball also carries contrib/gitlab.tpl, which turns Trivy output
+    # into the report format GitLab renders in the merge request widget.
+    - |
+      curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v$[[ inputs.trivy_version ]]/trivy_$[[ inputs.trivy_version ]]_Linux-64bit.tar.gz" -o /tmp/trivy.tar.gz
+      mkdir -p /tmp/trivy-dist
+      tar -xzf /tmp/trivy.tar.gz -C /tmp/trivy-dist
+      mv /tmp/trivy-dist/trivy /usr/local/bin/trivy
+      mkdir -p /usr/local/share/trivy/templates
+      cp /tmp/trivy-dist/contrib/*.tpl /usr/local/share/trivy/templates/
+      rm -rf /tmp/trivy.tar.gz /tmp/trivy-dist
+      trivy --version
+
+  script:
+    # -----------------------------------------------------------------------
+    # Scan the source before anything is built: dependency CVEs from lock
+    # files, committed secrets, and Dockerfile misconfiguration.
+    #
+    # Two passes on purpose. The first produces a full-severity report; the
+    # second is filtered to the severities that should actually block. The
+    # database is cached between them.
+    # -----------------------------------------------------------------------
+    - >
+      trivy fs --config "$[[ inputs.trivy_config ]]"
+      --format sarif --output trivy-source.sarif --exit-code 0
+      "$[[ inputs.build_context ]]"
+    - >
+      trivy fs --config "$[[ inputs.trivy_config ]]"
+      --severity "$[[ inputs.trivy_severity ]]"
+      --format table --exit-code 1
+      "$[[ inputs.build_context ]]"
+
+    # -----------------------------------------------------------------------
+    # Build. The image stays on the runner until the scan below passes.
+    # -----------------------------------------------------------------------
+    - >
+      docker build
+      --file "$[[ inputs.dockerfile ]]"
+      --tag "$IMAGE_REF:$IMAGE_TAG"
+      --build-arg "REGISTRY=$REGISTRY"
+      --build-arg "SAFE_CHAIN_VERSION=$[[ inputs.safe_chain_version ]]"
+      --build-arg "SAFE_CHAIN_SHA256=$[[ inputs.safe_chain_sha256 ]]"
+      --label "org.opencontainers.image.revision=$CI_COMMIT_SHA"
+      --label "org.opencontainers.image.source=$CI_PROJECT_URL"
+      "$[[ inputs.build_context ]]"
+
+    # -----------------------------------------------------------------------
+    # Scan the built image. This is the gate that keeps the shared registry
+    # clean: nothing is pushed until it passes.
+    # -----------------------------------------------------------------------
+    - >
+      trivy image --config "$[[ inputs.trivy_config ]]"
+      --format sarif --output trivy-image.sarif --exit-code 0
+      "$IMAGE_REF:$IMAGE_TAG"
+    - >
+      trivy image --config "$[[ inputs.trivy_config ]]"
+      --severity "$[[ inputs.trivy_severity ]]"
+      --format table --exit-code 1
+      "$IMAGE_REF:$IMAGE_TAG"
+    - >
+      trivy image --format template
+      --template "@/usr/local/share/trivy/templates/gitlab.tpl"
+      --output gl-container-scanning-report.json --exit-code 0
+      "$IMAGE_REF:$IMAGE_TAG"
+    - >
+      trivy image --format cyclonedx
+      --output sbom.cyclonedx.json --exit-code 0
+      "$IMAGE_REF:$IMAGE_TAG"
+
+    # -----------------------------------------------------------------------
+    # Push. OIDC only - the runner holds no registry password.
+    # -----------------------------------------------------------------------
+    - |
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
+        echo "Merge request pipeline: scans ran, skipping push."
+        exit 0
+      fi
+
+      : "${AZURE_CLIENT_ID:?set AZURE_CLIENT_ID as a project or group CI/CD variable}"
+      : "${AZURE_TENANT_ID:?set AZURE_TENANT_ID as a project or group CI/CD variable}"
+
+      # Trade GitLab's job token for an Entra access token. This is the plain
+      # OAuth2 client-credentials flow with a federated client assertion - the
+      # same thing `az login --federated-token` does, without needing the
+      # Azure CLI on a docker:cli image.
+      access_token="$(curl -sS --fail-with-body -X POST \
+        "https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        --data-urlencode "grant_type=client_credentials" \
+        --data-urlencode "client_id=${AZURE_CLIENT_ID}" \
+        --data-urlencode "scope=https://containerregistry.azure.net/.default" \
+        --data-urlencode "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+        --data-urlencode "client_assertion=${AZURE_ID_TOKEN}" | jq -r '.access_token')"
+
+      if [ -z "$access_token" ] || [ "$access_token" = "null" ]; then
+        echo "Failed to obtain an Entra token. Check the federated credential's issuer and subject." >&2
+        exit 1
+      fi
+
+      # Exchange it for an ACR refresh token. This needs no control-plane
+      # permission, which matters because the pipeline identity deliberately
+      # holds repository data-plane permissions only.
+      refresh_token="$(curl -sS --fail-with-body -X POST \
+        "https://${REGISTRY}/oauth2/exchange" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        --data-urlencode "grant_type=access_token" \
+        --data-urlencode "service=${REGISTRY}" \
+        --data-urlencode "tenant=${AZURE_TENANT_ID}" \
+        --data-urlencode "access_token=${access_token}" | jq -r '.refresh_token')"
+
+      printf '%s' "${refresh_token}" | docker login "${REGISTRY}" \
+        --username 00000000-0000-0000-0000-000000000000 --password-stdin
+
+      docker push "$IMAGE_REF:$IMAGE_TAG"
+
+      # Moving tag for the default branch only. Every other build is
+      # addressable solely by its immutable commit tag.
+      if [ "$CI_COMMIT_BRANCH" = "$[[ inputs.default_branch ]]" ]; then
+        docker tag "$IMAGE_REF:$IMAGE_TAG" "$IMAGE_REF:latest"
+        docker push "$IMAGE_REF:latest"
+      fi
+
+  after_script:
+    - docker logout "$REGISTRY" || true
+
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - trivy-source.sarif
+      - trivy-image.sarif
+      - sbom.cyclonedx.json
+    reports:
+      container_scanning: gl-container-scanning-report.json
+
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $[[ inputs.default_branch ]]
+    - if: $CI_COMMIT_TAG
