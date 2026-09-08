@@ -26,8 +26,14 @@ Google Fonts stylesheet.
 
 ## Publishing
 
-*Settings → Pages → Deploy from a branch → `main` / `/docs`.* The `.nojekyll` file stops
-Jekyll from touching the output.
+GitHub Pages, deployed by [`.github/workflows/pages.yml`](../.github/workflows/pages.yml)
+on every push to `main` that touches `docs/`. The workflow re-runs
+`tools/build_docs.py --check` before it uploads, so a stale `index.html` fails the deploy
+instead of being served.
+
+Enable it once, in *Settings → Pages → Source → **GitHub Actions***. The `.nojekyll` file
+is kept for the older *Deploy from a branch → `main` / `/docs`* mode; the Actions
+deployment serves the artifact as-is and never runs Jekyll.
 
 ## Adding a CI platform
 

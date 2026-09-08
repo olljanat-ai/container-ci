@@ -60,6 +60,13 @@ space-separated list, so `data-tool="github gitlab"` shows for both. Slugs are
   `.code`. The page body must never scroll sideways.
 - **Callouts are rationed.** `.note` and `.note--watch` earn their border by being rare.
 
+## Publishing
+
+`.github/workflows/pages.yml` deploys `docs/` to GitHub Pages on every push to `main`
+that touches it. It runs `tools/build_docs.py --check` first, so an un-regenerated
+`index.html` fails the deploy rather than reaching the site. Nothing to do by hand; the
+one-time setup is *Settings → Pages → Source → **GitHub Actions***.
+
 ## Verify
 
 ```bash

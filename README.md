@@ -9,7 +9,8 @@ systems — **Azure DevOps**, **GitHub Actions** and **GitLab CI** — implement
 identical build contract: scan the source, build, scan the image, and only then push.
 
 **→ [Start here: the guidance site](docs/index.html)** — pick your CI system and follow
-the setup. Publish it with *Settings → Pages → Deploy from a branch → `main` / `/docs`*.
+the setup. It is published to GitHub Pages by
+[`.github/workflows/pages.yml`](.github/workflows/pages.yml) on every push to `main`.
 
 ---
 
