@@ -35,7 +35,10 @@ exit-code: 1
 # `--exit-on-eol 1` to the gate step, if you want EOL distros to block.
 exit-on-eol: 0
 
-# Dismissed findings live in .trivyignore, each with an expiry date.
+# Dismissed findings live in .trivyignore, each with an expiry date. The path is
+# resolved relative to the working directory, not to this file - which is why
+# trivy.yaml and .trivyignore both belong in your repository root, and why the
+# pipelines run Trivy from there.
 ignorefile: .trivyignore
 
 vulnerability:
