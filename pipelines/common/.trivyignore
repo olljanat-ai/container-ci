@@ -1,0 +1,14 @@
+# Trivy findings that are accepted for now.
+#
+# Rules for this file:
+#   1. Every entry needs an expiry date and a reason. An entry without one is a
+#      finding nobody owns.
+#   2. Prefer `exp:` so the entry re-opens itself instead of ageing silently.
+#   3. Suppress the narrowest thing that works - a single CVE, not a package.
+#
+# Format: https://trivy.dev/latest/docs/configuration/filtering/#by-finding-ids
+#
+# Example:
+# CVE-2024-00000 exp:2026-12-31
+#   No fix upstream; the affected code path is not reachable from our entrypoint.
+#   Owner: platform-team. Re-checked 2026-09-08.

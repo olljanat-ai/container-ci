@@ -1,0 +1,49 @@
+###############################################################################
+# Copy this file into your project repository as
+# .github/workflows/container.yml and edit the four values under `with:`.
+#
+# It delegates the whole build to the central reusable workflow, so a change to
+# the shared scanning policy reaches every project without touching this file.
+###############################################################################
+name: Container image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+# Two pushes to the same branch should not race each other into the registry.
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    uses: olljanat-ai/container-ci/.github/workflows/build-and-push.yml@main
+
+    # The called workflow cannot grant itself more than this.
+    permissions:
+      contents: read
+      id-token: write # mint the OIDC token the federated credential accepts
+      security-events: write # upload Trivy SARIF to code scanning
+
+    with:
+      registry: contosocentralregistry.azurecr.io
+
+      # Must start with your tenant's namespace. Pushing outside it is denied
+      # by the ABAC condition on the pipeline identity, not just by convention.
+      image: payments/api
+
+      # From `terraform output -json ci_identities`. These are identifiers, not
+      # credentials, so repository variables are the right home for them.
+      azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+      azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+      azure-subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Optional; these are the defaults.
+      # dockerfile: Dockerfile
+      # context: .
+      # trivy-config: trivy.yaml
+      # trivy-severity: HIGH,CRITICAL

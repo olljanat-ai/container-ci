@@ -1,0 +1,343 @@
+###############################################################################
+# Reusable workflow: build a Dockerfile, scan it, push it to the central ACR.
+#
+# This workflow only runs when another workflow calls it, so it never triggers
+# on its own in this repository. Consume it from a project repository:
+#
+#   jobs:
+#     image:
+#       uses: olljanat-ai/container-ci/.github/workflows/build-and-push.yml@main
+#       permissions:
+#         contents: read
+#         id-token: write          # required for the OIDC token
+#         security-events: write   # required to upload SARIF
+#       with:
+#         registry: contosocentralregistry.azurecr.io
+#         image: payments/api
+#         azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+#         azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+#         azure-subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+#
+# See pipelines/github/ for a complete caller example.
+#
+# Order of operations: scan the source, build, scan the image, and only then
+# push. A vulnerable image never reaches the shared registry.
+###############################################################################
+name: Build, scan and push container image
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: "Registry login server, e.g. contosocentralregistry.azurecr.io"
+        required: true
+        type: string
+      image:
+        description: "Repository inside the registry. Must start with your tenant's namespace, e.g. payments/api"
+        required: true
+        type: string
+      azure-client-id:
+        description: "Client ID of the tenant's pipeline managed identity (terraform output ci_identities). An identifier, not a secret."
+        required: true
+        type: string
+      azure-tenant-id:
+        description: "Entra tenant ID."
+        required: true
+        type: string
+      azure-subscription-id:
+        description: "Subscription hosting the registry."
+        required: true
+        type: string
+      dockerfile:
+        description: "Path to the Dockerfile."
+        required: false
+        type: string
+        default: "Dockerfile"
+      context:
+        description: "Build context passed to docker build."
+        required: false
+        type: string
+        default: "."
+      build-args:
+        description: "Newline-separated build arguments."
+        required: false
+        type: string
+        default: ""
+      platforms:
+        description: "Target platform. A single platform, because the image is loaded into the local daemon so it can be scanned before it is pushed."
+        required: false
+        type: string
+        default: "linux/amd64"
+      push:
+        description: "Push after the scans pass. Callers normally leave this as the default, which pushes on branch and tag builds but not on pull requests."
+        required: false
+        type: boolean
+        default: true
+      trivy-config:
+        description: "Path to the shared Trivy policy. Defaults to the copy vendored in the calling repository."
+        required: false
+        type: string
+        default: "trivy.yaml"
+      trivy-severity:
+        description: "Severities that fail the build."
+        required: false
+        type: string
+        default: "HIGH,CRITICAL"
+      runs-on:
+        description: "Runner label."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+    outputs:
+      image-digest:
+        description: "Digest of the image that was built."
+        value: ${{ jobs.build.outputs.digest }}
+      image-tags:
+        description: "Tags applied to the image."
+        value: ${{ jobs.build.outputs.tags }}
+
+env:
+  TRIVY_VERSION: "v0.74.0"
+  SAFE_CHAIN_VERSION: "1.5.18"
+  SAFE_CHAIN_SHA256: "bdbc58829853e598c09874fcc193f7cdb2a9a848875be45260a8b59bc4ce5439"
+
+jobs:
+  build:
+    name: Build, scan and push
+    runs-on: ${{ inputs.runs-on }}
+
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # ---------------------------------------------------------------------
+      # Supply chain: block malicious packages before they are installed.
+      #
+      # This covers what the *job* installs. Dependencies installed inside
+      # `docker build` are covered by installing Safe Chain in the Dockerfile's
+      # build stage - see pipelines/common/Dockerfile.
+      # ---------------------------------------------------------------------
+      - name: Install Aikido Safe Chain
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/AikidoSec/safe-chain/releases/download/${SAFE_CHAIN_VERSION}/install-safe-chain.sh" -o /tmp/install-safe-chain.sh
+          echo "${SAFE_CHAIN_SHA256}  /tmp/install-safe-chain.sh" | sha256sum -c -
+          sh /tmp/install-safe-chain.sh --ci
+          rm /tmp/install-safe-chain.sh
+          echo "${HOME}/.safe-chain/shims" >> "${GITHUB_PATH}"
+          echo "${HOME}/.safe-chain/bin" >> "${GITHUB_PATH}"
+
+      - name: Verify Safe Chain is intercepting package managers
+        run: safe-chain --version
+
+      # ---------------------------------------------------------------------
+      # Scan the source before anything is built: dependency CVEs from lock
+      # files, committed secrets, and Dockerfile misconfiguration.
+      # ---------------------------------------------------------------------
+      - name: Scan source with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: fs
+          scan-ref: ${{ inputs.context }}
+          trivy-config: ${{ inputs.trivy-config }}
+          format: sarif
+          output: trivy-source.sarif
+          exit-code: "0" # reported below; the blocking pass is the next step
+
+      - name: Upload source scan to code scanning
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        if: always() && hashFiles('trivy-source.sarif') != ''
+        with:
+          sarif_file: trivy-source.sarif
+          category: trivy-source
+
+      - name: Fail on source findings
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: fs
+          scan-ref: ${{ inputs.context }}
+          trivy-config: ${{ inputs.trivy-config }}
+          severity: ${{ inputs.trivy-severity }}
+          format: table
+          exit-code: "1"
+
+      # ---------------------------------------------------------------------
+      # Build. The image is loaded into the local daemon rather than pushed, so
+      # the scan below decides whether it ever reaches the registry.
+      # ---------------------------------------------------------------------
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Compute tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ inputs.registry }}/${{ inputs.image }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            REGISTRY=${{ inputs.registry }}
+            SAFE_CHAIN_VERSION=${{ env.SAFE_CHAIN_VERSION }}
+            SAFE_CHAIN_SHA256=${{ env.SAFE_CHAIN_SHA256 }}
+            ${{ inputs.build-args }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Resolve primary tag
+        id: tag
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          primary="$(printf '%s\n' "${TAGS}" | head -n1)"
+          echo "primary=${primary}" >> "${GITHUB_OUTPUT}"
+
+      # ---------------------------------------------------------------------
+      # Scan the built image. This is the gate that keeps the shared registry
+      # clean: nothing is pushed until it passes.
+      # ---------------------------------------------------------------------
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: image
+          image-ref: ${{ steps.tag.outputs.primary }}
+          trivy-config: ${{ inputs.trivy-config }}
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: "0"
+
+      - name: Upload image scan to code scanning
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        if: always() && hashFiles('trivy-image.sarif') != ''
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Fail on image findings
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: image
+          image-ref: ${{ steps.tag.outputs.primary }}
+          trivy-config: ${{ inputs.trivy-config }}
+          severity: ${{ inputs.trivy-severity }}
+          format: table
+          exit-code: "1"
+
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          scan-type: image
+          image-ref: ${{ steps.tag.outputs.primary }}
+          format: cyclonedx
+          output: sbom.cyclonedx.json
+          exit-code: "0"
+
+      - name: Publish scan results and SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: container-scan-${{ github.run_id }}
+          path: |
+            trivy-source.sarif
+            trivy-image.sarif
+            sbom.cyclonedx.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ---------------------------------------------------------------------
+      # Push. OIDC only - the identity is federated to this repository and ref,
+      # so no registry password exists to leak.
+      # ---------------------------------------------------------------------
+      - name: Sign in to Azure
+        if: ${{ inputs.push && github.event_name != 'pull_request' }}
+        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
+        with:
+          client-id: ${{ inputs.azure-client-id }}
+          tenant-id: ${{ inputs.azure-tenant-id }}
+          subscription-id: ${{ inputs.azure-subscription-id }}
+
+      - name: Sign in to the registry
+        if: ${{ inputs.push && github.event_name != 'pull_request' }}
+        env:
+          REGISTRY: ${{ inputs.registry }}
+          AZURE_TENANT_ID: ${{ inputs.azure-tenant-id }}
+        run: |
+          set -euo pipefail
+          # The pipeline identity holds repository data-plane permissions only,
+          # so `az acr login` (which resolves the registry through ARM) is not
+          # guaranteed to work. Exchange the Entra token for an ACR refresh
+          # token instead - the same exchange az performs internally.
+          access_token="$(az account get-access-token \
+            --resource https://containerregistry.azure.net \
+            --query accessToken -o tsv)"
+          refresh_token="$(curl -sS --fail-with-body -X POST \
+            "https://${REGISTRY}/oauth2/exchange" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "grant_type=access_token" \
+            --data-urlencode "service=${REGISTRY}" \
+            --data-urlencode "tenant=${AZURE_TENANT_ID}" \
+            --data-urlencode "access_token=${access_token}" | jq -r '.refresh_token')"
+          printf '%s' "${refresh_token}" | docker login "${REGISTRY}" \
+            --username 00000000-0000-0000-0000-000000000000 --password-stdin
+
+      - name: Push image
+        if: ${{ inputs.push && github.event_name != 'pull_request' }}
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "${TAGS}" | while read -r tag; do
+            [ -n "${tag}" ] || continue
+            echo "Pushing ${tag}"
+            docker push "${tag}"
+          done
+
+      - name: Record digest
+        id: digest
+        if: ${{ inputs.push && github.event_name != 'pull_request' }}
+        env:
+          PRIMARY: ${{ steps.tag.outputs.primary }}
+        run: |
+          set -euo pipefail
+          digest="$(docker image inspect "${PRIMARY}" --format '{{ index .RepoDigests 0 }}')"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          echo "Pushed ${digest}"
+
+      - name: Sign out of the registry
+        if: always()
+        env:
+          REGISTRY: ${{ inputs.registry }}
+        run: docker logout "${REGISTRY}" || true

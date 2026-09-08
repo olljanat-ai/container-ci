@@ -1,0 +1,63 @@
+###############################################################################
+# Shared Trivy configuration.
+#
+# Every pipeline in this repository points Trivy at this file (TRIVY_CONFIG or
+# `--config`), so all three platforms enforce the same policy and a policy
+# change is a one-file change.
+#
+# Reference: https://trivy.dev/latest/docs/references/configuration/config-file/
+###############################################################################
+
+timeout: 15m
+
+scan:
+  scanners:
+    - vuln
+    - secret
+    - misconfig
+
+# Findings at or above these levels fail the build. Anything lower is still
+# reported in the SARIF/JSON output but does not block, so the gate stays
+# actionable.
+severity:
+  - HIGH
+  - CRITICAL
+
+# Fail the step when a finding at or above `severity` survives the filters
+# below. The report-only passes in the pipelines (SBOM, SARIF upload) override
+# this back to 0 on the command line.
+exit-code: 1
+
+# End-of-life base images are reported but do not set a distinct exit code
+# here: the pipelines run Trivy twice - once to produce a full SARIF report and
+# once as the blocking gate - and a non-zero exit from the report pass would
+# stop the results being uploaded. Set this to 1 in a scheduled job, or add
+# `--exit-on-eol 1` to the gate step, if you want EOL distros to block.
+exit-on-eol: 0
+
+# Dismissed findings live in .trivyignore, each with an expiry date.
+ignorefile: .trivyignore
+
+vulnerability:
+  # Only fail on vulnerabilities that have a fix available. An unfixable CVE in
+  # a base image cannot be actioned by the team that owns the application, and
+  # blocking on it teaches people to bypass the gate. Catch those separately
+  # with a scheduled `--ignore-unfixed=false` run against the whole registry.
+  ignore-unfixed: true
+
+pkg:
+  types:
+    - os
+    - library
+
+misconfiguration:
+  include-non-failures: false
+
+db:
+  no-progress: true
+  # Trivy's vulnerability database is pulled from a container registry. If your
+  # runners cannot reach ghcr.io, mirror the DB into the central registry and
+  # point these entries at <login-server>/cache/... instead.
+  repository:
+    - mirror.gcr.io/aquasec/trivy-db:2
+    - ghcr.io/aquasecurity/trivy-db:2

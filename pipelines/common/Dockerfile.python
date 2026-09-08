@@ -1,0 +1,68 @@
+# syntax=docker/dockerfile:1.11
+###############################################################################
+# Reference Dockerfile for the central registry pipelines (Python).
+#
+# Same shape as ./Dockerfile: Safe Chain is installed in the build stage before
+# any `pip install`, so PyPI downloads are checked against Aikido Intel inside
+# the build container. The runtime stage carries neither Safe Chain nor a
+# compiler toolchain.
+###############################################################################
+
+ARG REGISTRY=docker.io
+ARG PYTHON_IMAGE=${REGISTRY}/cache/docker-hub/library/python:3.13-slim-bookworm
+
+ARG SAFE_CHAIN_VERSION=1.5.18
+ARG SAFE_CHAIN_SHA256=bdbc58829853e598c09874fcc193f7cdb2a9a848875be45260a8b59bc4ce5439
+
+###############################################################################
+# Stage 1 - dependencies, behind Safe Chain
+###############################################################################
+FROM ${PYTHON_IMAGE} AS build
+
+ARG SAFE_CHAIN_VERSION
+ARG SAFE_CHAIN_SHA256
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "https://github.com/AikidoSec/safe-chain/releases/download/${SAFE_CHAIN_VERSION}/install-safe-chain.sh" -o /tmp/install-safe-chain.sh \
+ && echo "${SAFE_CHAIN_SHA256}  /tmp/install-safe-chain.sh" | sha256sum -c - \
+ && sh /tmp/install-safe-chain.sh --ci --install-dir /usr/local/safe-chain \
+ && rm /tmp/install-safe-chain.sh
+
+ENV PATH="/usr/local/safe-chain/shims:/usr/local/safe-chain/bin:${PATH}"
+
+RUN pip safe-chain-verify
+
+WORKDIR /app
+
+# Dependencies land in their own prefix so the runtime stage can copy just
+# them, without pip, the compiler, or Safe Chain.
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+COPY . .
+
+###############################################################################
+# Stage 2 - runtime
+###############################################################################
+FROM ${PYTHON_IMAGE} AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN useradd --create-home --uid 10001 app
+
+WORKDIR /app
+
+COPY --from=build /install /usr/local
+COPY --from=build --chown=app:app /app /app
+
+USER app
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status == 200 else 1)"
+
+CMD ["python", "-m", "app"]
