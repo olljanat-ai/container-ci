@@ -1,0 +1,867 @@
+<title>Container CI</title>
+<meta name="description" content="Build, scan and push container images to the shared Azure Container Registry. Pick your CI system for step-by-step setup." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600&display=swap" />
+<link rel="stylesheet" href="assets/style.css" />
+
+<div class="shell">
+
+  <header class="masthead">
+    <div class="masthead__id">
+      <p class="eyebrow">Platform engineering</p>
+      <h1>Container CI</h1>
+      <p class="masthead__lede">
+        One shared Azure Container Registry, one build contract, three CI systems.
+        Pick yours on the left and follow the setup; everything below it is the same
+        wherever you build.
+      </p>
+    </div>
+
+    <div class="masthead__id">
+      <dl class="masthead__facts">
+        <div>
+          <dt>Registry</dt>
+          <dd>Premium ACR</dd>
+        </div>
+        <div>
+          <dt>Isolation</dt>
+          <dd>Entra ABAC</dd>
+        </div>
+        <div>
+          <dt>Scanner</dt>
+          <dd>Trivy 0.74</dd>
+        </div>
+        <div>
+          <dt>Supply chain</dt>
+          <dd>Safe Chain 1.5</dd>
+        </div>
+      </dl>
+      <button class="theme-toggle" type="button">Dark</button>
+    </div>
+  </header>
+
+  <aside class="rail">
+    <div class="rail__inner">
+      <div>
+        <span class="chooser__label" id="chooser-label">Your CI system</span>
+        <div class="chooser" role="group" aria-labelledby="chooser-label">
+          <button class="chooser__option" type="button" data-tool-select="azure-devops" aria-pressed="false">
+            <span class="chooser__name">Azure DevOps</span>
+            <span class="chooser__key">Pipelines</span>
+          </button>
+          <button class="chooser__option" type="button" data-tool-select="github" aria-pressed="false">
+            <span class="chooser__name">GitHub</span>
+            <span class="chooser__key">Actions</span>
+          </button>
+          <button class="chooser__option" type="button" data-tool-select="gitlab" aria-pressed="false">
+            <span class="chooser__name">GitLab</span>
+            <span class="chooser__key">CI/CD</span>
+          </button>
+        </div>
+      </div>
+
+      <nav aria-label="Sections">
+        <ol>
+          <li><a href="#overview">How it fits together</a></li>
+          <li><a href="#setup">Set up your project</a></li>
+          <li><a href="#contract">The build contract</a></li>
+          <li><a href="#namespaces">Namespaces and access</a></li>
+          <li><a href="#scanning">What fails a build</a></li>
+          <li><a href="#supply-chain">Blocking malicious packages</a></li>
+          <li><a href="#registry">Running the registry</a></li>
+          <li><a href="#troubleshooting">When it breaks</a></li>
+        </ol>
+      </nav>
+    </div>
+  </aside>
+
+  <main>
+
+    <!-- ================================================================ -->
+    <section id="overview">
+      <h2>How it fits together</h2>
+
+      <p>
+        Every project pushes to the same registry. What keeps projects apart is not a
+        separate registry each, and not a firewall — it is the repository namespace.
+        Your pipeline gets an identity that can write to <code>yourteam/</code> and
+        nowhere else, and that boundary is enforced by Azure, not by convention.
+      </p>
+
+      <p>
+        The registry is reachable from the public internet on purpose. Hosted CI runners
+        have no stable egress address, so locking the registry to an IP range would mean
+        every team running self-hosted runners. Authorization does the work instead:
+        there is no anonymous access, no shared admin password, and every pipeline
+        authenticates as itself.
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Piece</th>
+              <th scope="col">What it is</th>
+              <th scope="col">Where it lives</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Registry</td>
+              <td>One Premium Azure Container Registry, deployed with the Azure Verified Module for ACR</td>
+              <td><code>infra/terraform</code></td>
+            </tr>
+            <tr>
+              <td>Tenancy</td>
+              <td>Repository namespaces, enforced by ABAC conditions on role assignments</td>
+              <td><code>infra/terraform</code></td>
+            </tr>
+            <tr>
+              <td>Identity</td>
+              <td>One managed identity per pipeline, federated to your repository and branch</td>
+              <td><code>infra/terraform</code></td>
+            </tr>
+            <tr>
+              <td>Pipelines</td>
+              <td>The same seven steps for Azure DevOps, GitHub Actions and GitLab CI</td>
+              <td><code>pipelines/</code></td>
+            </tr>
+            <tr>
+              <td>Scan policy</td>
+              <td>A single Trivy configuration all three platforms load</td>
+              <td><code>pipelines/common/trivy.yaml</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        You need three values before you start. All three come out of Terraform, and
+        none of them is a secret — there is no registry password anywhere in this
+        design.
+      </p>
+
+      <div class="code">
+        <div class="code__bar">
+          <span class="code__path">terraform output</span>
+          <button class="code__copy" type="button">Copy</button>
+        </div>
+        <pre><code data-lang="shell">cd infra/terraform
+
+terraform output login_server            # contosocentralregistry.azurecr.io
+terraform output azure_tenant_id         # your Entra tenant
+terraform output -json ci_identities     # client_id per pipeline identity</code></pre>
+      </div>
+    </section>
+
+    <!-- ================================================================ -->
+    <section id="setup">
+      <h2>Set up your project</h2>
+
+      <!-- ---------------------------------------------------- Azure DevOps -->
+      <div data-tool="azure-devops">
+        <span class="scope-note">Azure DevOps Pipelines</span>
+
+        <h3>1. Create the service connection</h3>
+        <p>
+          In your Azure DevOps project, go to <strong>Project settings → Service
+          connections → New → Azure Resource Manager → Workload Identity federation
+          (manual)</strong>. Enter the subscription and the <code>client_id</code> of
+          your tenant's managed identity.
+        </p>
+        <p>
+          Azure DevOps then shows an <strong>Issuer</strong> and a <strong>Subject
+          identifier</strong>. This is a two-step dance, because the service connection
+          has to exist before its subject does: create the identity with a placeholder
+          subject, create the connection with the resulting client ID, then paste the
+          real issuer and subject back into Terraform and re-apply.
+        </p>
+
+        <h3>2. Register the identity</h3>
+        <div class="code">
+          <div class="code__bar">
+            <span class="code__path">infra/terraform/terraform.tfvars</span>
+            <button class="code__copy" type="button">Copy</button>
+          </div>
+          <pre><code data-lang="hcl">tenants = {
+  reporting = {
+    display_name = "Reporting"
+
+    ci_identities = {
+      build = {
+        access  = "push"
+        issuer  = "https://vstoken.dev.azure.com/&lt;organization-id&gt;"
+        subject = "sc://&lt;organization&gt;/&lt;project&gt;/acr-push"
+      }
+    }
+  }
+}</code></pre>
+        </div>
+        <p>
+          The subject is checked on every token exchange. Another project's service
+          connection cannot use this identity even if it knows the client ID.
+        </p>
+
+        <h3>3. Add the pipeline</h3>
+        <p>
+          Copy the reference build assets from <code>pipelines/common</code> into your
+          repository root — <code>Dockerfile</code>, <code>trivy.yaml</code> and
+          <code>.trivyignore</code> — then add this as <code>azure-pipelines.yml</code>
+          and edit the three values under <code>parameters</code>.
+        </p>
+        <div class="code">
+          <div class="code__bar">
+            <span class="code__path">azure-pipelines.yml</span>
+            <button class="code__copy" type="button">Copy</button>
+          </div>
+          <pre><code data-lang="yaml">{{include:pipelines/azure-devops/azure-pipelines.yml}}</code></pre>
+        </div>
+        <p>
+          The build itself lives in the shared template, so a change to the scanning
+          policy reaches your project without you editing anything.
+        </p>
+      </div>
+
+      <!-- --------------------------------------------------- GitHub Actions -->
+      <div data-tool="github">
+        <span class="scope-note">GitHub Actions</span>
+
+        <h3>1. Register the identity</h3>
+        <p>
+          Add your project to <code>var.tenants</code> in Terraform. The
+          <code>subject</code> has to match the token GitHub actually mints for the job:
+        </p>
+        <div class="code">
+          <div class="code__bar">
+            <span class="code__path">infra/terraform/terraform.tfvars</span>
+            <button class="code__copy" type="button">Copy</button>
+          </div>
+          <pre><code data-lang="hcl">tenants = {
+  payments = {
+    display_name = "Payments platform"
+
+    ci_identities = {
+      build = {
+        access  = "push"
+        issuer  = "https://token.actions.githubusercontent.com"
+        subject = "repo:contoso/payments-api:ref:refs/heads/main"
+      }
+    }
+  }
+}</code></pre>
+        </div>
+        <p>
+          GitHub issues a different <code>sub</code> claim for branches, tags, pull
+          requests and each environment. Add one <code>ci_identities</code> entry per
+          subject you build from, or federate on
+          <code>repo:&lt;owner&gt;/&lt;repo&gt;:environment:&lt;name&gt;</code>, which
+          stays stable across refs.
+        </p>
+
+        <h3>2. Add three repository variables</h3>
+        <p>
+          Under <strong>Settings → Secrets and variables → Actions → Variables</strong>.
+          These are identifiers, not credentials — they belong in variables, not secrets.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th scope="col">Variable</th><th scope="col">Value</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>AZURE_CLIENT_ID</td><td><code>client_id</code> from <code>terraform output -json ci_identities</code></td></tr>
+              <tr><td>AZURE_TENANT_ID</td><td><code>terraform output azure_tenant_id</code></td></tr>
+              <tr><td>AZURE_SUBSCRIPTION_ID</td><td><code>terraform output azure_subscription_id</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>3. Add the workflow</h3>
+        <p>
+          Copy the reference build assets from <code>pipelines/common</code> into your
+          repository root — <code>Dockerfile</code>, <code>trivy.yaml</code> and
+          <code>.trivyignore</code> — then add this as
+          <code>.github/workflows/container.yml</code> and edit
+          <code>registry</code> and <code>image</code>.
+        </p>
+        <div class="code">
+          <div class="code__bar">
+            <span class="code__path">.github/workflows/container.yml</span>
+            <button class="code__copy" type="button">Copy</button>
+          </div>
+          <pre><code data-lang="yaml">{{include:pipelines/github/workflows/container.yml}}</code></pre>
+        </div>
+        <p>
+          The build itself lives in the shared reusable workflow, so a change to the
+          scanning policy reaches your repository without you editing anything.
+        </p>
+      </div>
+
+      <!-- --------------------------------------------------------- GitLab CI -->
+      <div data-tool="gitlab">
+        <span class="scope-note">GitLab CI/CD</span>
+
+        <h3>1. Register the identity</h3>
+        <p>
+          Add your project to <code>var.tenants</code> in Terraform. The
+          <code>subject</code> has to match the ID token GitLab mints for the job:
+        </p>
+        <div class="code">
+          <div class="code__bar">
+            <span class="code__path">infra/terraform/terraform.tfvars</span>
+            <button class="code__copy" type="button">Copy</button>
+          </div>
+          <pre><code data-lang="hcl">tenants = {
+  web = {
+    display_name = "Web frontend"
+
+    ci_identities = {
+      build = {
+        access  = "push"
+        issuer  = "https://gitlab.com" # your instance URL if self-managed
+        subject = "project_path:contoso/web:ref_type:branch:ref:main"
+      }
+    }
+  }
+}</code></pre>
+        </div>
+        <p>
+          Tag pipelines produce <code>ref_type:tag:ref:&lt;tag&gt;</code>, so add a
+          second entry if you build from tags.
+        </p>
+
+        <h3>2. Add two CI/CD variables</h3>
+        <p>
+          Under <strong>Settings → CI/CD → Variables</strong> — on the group, if several
+          projects share the registry. Neither is a credential, so neither needs masking
+          or protection.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th scope="col">Variable</th><th scope="col">Value</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>AZURE_CLIENT_ID</td><td><code>client_id</code> from <code>terraform output -json ci_identities</code></td></tr>
+              <tr><td>AZURE_TENANT_ID</td><td><code>terraform output azure_tenant_id</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>
+          They are read at job runtime rather than passed as component inputs, because
+          <code>include:inputs</code> is resolved before CI/CD variables exist.
+        </p>
+
+        <h3>3. Add the pipeline</h3>
+        <p>
+          Copy the reference build assets from <code>pipelines/common</code> into your
+          repository root — <code>Dockerfile</code>, <code>trivy.yaml</code> and
+          <code>.trivyignore</code> — then add this as <code>.gitlab-ci.yml</code> and
+          edit <code>registry</code> and <code>image</code>.
+        </p>
+        <div class="code">
+          <div class="code__bar">
+            <span class="code__path">.gitlab-ci.yml</span>
+            <button class="code__copy" type="button">Copy</button>
+          </div>
+          <pre><code data-lang="yaml">{{include:pipelines/gitlab/.gitlab-ci.yml}}</code></pre>
+        </div>
+        <p>
+          The build itself lives in the shared component, so a change to the scanning
+          policy reaches your project without you editing anything.
+        </p>
+      </div>
+    </section>
+
+    <!-- ================================================================ -->
+    <section id="contract">
+      <h2>The build contract</h2>
+
+      <p>
+        All three platforms run these seven steps, in this order. The order is the point:
+        the image is built on the runner and held there until every scan has passed, so a
+        vulnerable image never lands in a registry that every project can read.
+      </p>
+
+      <ol class="steps">
+        <li>
+          <span class="steps__name">Install Aikido Safe Chain</span>
+          <span class="steps__where">Runner</span>
+          <span class="steps__note">
+            Shims npm, pnpm, yarn, pip, uv and poetry so every package the job installs is
+            checked against Aikido Intel before it is written to disk.
+          </span>
+        </li>
+        <li data-gate="true">
+          <span class="steps__name">Scan the source with Trivy</span>
+          <span class="steps__where">Gate</span>
+          <span class="steps__note">
+            Dependency CVEs from lock files, committed secrets, and Dockerfile
+            misconfiguration — before anything is built.
+          </span>
+        </li>
+        <li>
+          <span class="steps__name">Build the image</span>
+          <span class="steps__where">Runner</span>
+          <span class="steps__note">
+            Safe Chain is installed inside the Dockerfile's build stage as well, because
+            <code>npm ci</code> inside <code>docker build</code> runs in the build
+            container where the runner's shims do not exist.
+          </span>
+        </li>
+        <li data-gate="true">
+          <span class="steps__name">Scan the built image with Trivy</span>
+          <span class="steps__where">Gate</span>
+          <span class="steps__note">
+            OS packages and application libraries in the finished image. This is the gate
+            that keeps the shared registry clean.
+          </span>
+        </li>
+        <li>
+          <span class="steps__name">Generate a CycloneDX SBOM</span>
+          <span class="steps__where">Artifact</span>
+          <span class="steps__note">
+            Kept with the build, so you can answer "which of our images ship this
+            package" without rebuilding anything.
+          </span>
+        </li>
+        <li>
+          <span class="steps__name">Authenticate to Azure over OIDC</span>
+          <span class="steps__where">Federated</span>
+          <span class="steps__note">
+            The job's own token is exchanged for an Azure token. No registry password
+            exists in any CI system, so none can leak from one.
+          </span>
+        </li>
+        <li>
+          <span class="steps__name">Push</span>
+          <span class="steps__where">Default branch and tags</span>
+          <span class="steps__note">
+            Pull and merge request builds run every scan but never push.
+          </span>
+        </li>
+      </ol>
+
+      <h3>Image naming</h3>
+      <p>
+        The first path segment must be your namespace. A push outside it returns
+        <code>denied</code> no matter what the pipeline asks for.
+      </p>
+      <div class="code">
+        <div class="code__bar">
+          <span class="code__path">image reference</span>
+          <button class="code__copy" type="button">Copy</button>
+        </div>
+        <pre><code data-lang="shell">contosocentralregistry.azurecr.io/payments/api:9f2c1ab34d5e6f7089abcdef0123456789abcdef
+contosocentralregistry.azurecr.io/payments/api:latest        # default branch only
+contosocentralregistry.azurecr.io/payments/api:v1.4.2        # tag builds</code></pre>
+      </div>
+      <p>
+        Every build is tagged with the full commit SHA, so a deployment always names an
+        exact build. <code>latest</code> moves; the SHA tag never does.
+      </p>
+    </section>
+
+    <!-- ================================================================ -->
+    <section id="namespaces">
+      <h2>Namespaces and access</h2>
+
+      <p>
+        The registry is one flat set of repositories, split by prefix. Your team owns a
+        prefix; everyone can read the shared and cached ones.
+      </p>
+
+      <pre class="tree">contosocentralregistry.azurecr.io
+├── <b>shared/</b>                    <i>golden base images — everyone reads, platform team writes</i>
+├── <b>cache/</b>                     <i>pull-through cache of docker.io and mcr.microsoft.com</i>
+│   └── docker-hub/library/node
+├── <b>payments/</b>api               <i>payments team</i>
+├── <b>payments/</b>worker
+└── <b>web/</b>frontend               <i>web team</i></pre>
+
+      <p>
+        Each grant is an Azure role assignment on the registry carrying an ABAC condition
+        that pins it to those prefixes. This is what the pipeline identity for the
+        payments team actually holds:
+      </p>
+
+      <div class="code">
+        <div class="code__bar">
+          <span class="code__path">ABAC condition, rendered by Terraform</span>
+          <button class="code__copy" type="button">Copy</button>
+        </div>
+        <pre><code data-lang="shell">(
+ (
+  !(ActionMatches{'Microsoft.ContainerRegistry/registries/repositories/content/read'})
+  AND
+  !(ActionMatches{'Microsoft.ContainerRegistry/registries/repositories/content/write'})
+  AND
+  !(ActionMatches{'Microsoft.ContainerRegistry/registries/repositories/metadata/read'})
+  AND
+  !(ActionMatches{'Microsoft.ContainerRegistry/registries/repositories/metadata/write'})
+ )
+ OR
+ (
+  @Request[Microsoft.ContainerRegistry/registries/repositories:name] StringStartsWithIgnoreCase 'payments/'
+ )
+)</code></pre>
+      </div>
+
+      <p>
+        Read it as: <em>unless the caller is performing one of these repository data
+        actions this assignment says nothing; if they are, the repository name must start
+        with</em> <code>payments/</code>.
+      </p>
+
+      <div class="note note--watch">
+        <strong>The trailing slash is load-bearing.</strong> Without it,
+        <code>payments</code> would also match <code>payments-archive/secrets</code>.
+        Terraform rejects a namespace that does not end in <code>/</code>.
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Access</th>
+              <th scope="col">Role assigned</th>
+              <th scope="col">Own namespace</th>
+              <th scope="col">shared/ and cache/</th>
+              <th scope="col">Other teams</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>pull</td>
+              <td>Container Registry Repository Reader</td>
+              <td><span class="pill pill--allow">read</span></td>
+              <td><span class="pill pill--allow">read</span></td>
+              <td><span class="pill pill--deny">denied</span></td>
+            </tr>
+            <tr>
+              <td>push</td>
+              <td>Container Registry Repository Writer</td>
+              <td><span class="pill pill--allow">read + write</span></td>
+              <td><span class="pill pill--allow">read</span></td>
+              <td><span class="pill pill--deny">denied</span></td>
+            </tr>
+            <tr>
+              <td>contribute</td>
+              <td>Container Registry Repository Contributor</td>
+              <td><span class="pill pill--allow">read + write + delete</span></td>
+              <td><span class="pill pill--allow">read</span></td>
+              <td><span class="pill pill--deny">denied</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p>
+        Listing repository <em>names</em> is a separate role,
+        <code>Container Registry Repository Catalog Lister</code>, which does not accept
+        ABAC conditions — granting it exposes every repository name in the registry.
+        It is opt-in per team with <code>catalog_lister = true</code>, and off by default.
+      </p>
+
+      <h3>Base images come from the cache</h3>
+      <p>
+        Pull base images through the registry instead of from Docker Hub. That takes the
+        anonymous rate limit off the critical path of every build, and means an image
+        your fleet depends on is stored somewhere you control.
+      </p>
+      <div class="code">
+        <div class="code__bar">
+          <span class="code__path">Dockerfile</span>
+          <button class="code__copy" type="button">Copy</button>
+        </div>
+        <pre><code data-lang="dockerfile">ARG REGISTRY=docker.io
+ARG NODE_IMAGE=${REGISTRY}/cache/docker-hub/library/node:22-bookworm-slim
+
+FROM ${NODE_IMAGE} AS build</code></pre>
+      </div>
+      <p>
+        The pipelines pass <code>REGISTRY</code> as a build argument, so the same
+        Dockerfile still builds on a laptop with no registry access.
+      </p>
+    </section>
+
+    <!-- ================================================================ -->
+    <section id="scanning">
+      <h2>What fails a build</h2>
+
+      <p>
+        One Trivy configuration is shared by all three platforms, so what blocks a build
+        is a one-file decision rather than three drifting copies.
+      </p>
+
+      <div class="code">
+        <div class="code__bar">
+          <span class="code__path">pipelines/common/trivy.yaml</span>
+          <button class="code__copy" type="button">Copy</button>
+        </div>
+        <pre><code data-lang="yaml">{{include:pipelines/common/trivy.yaml}}</code></pre>
+      </div>
+
+      <h3>Why Trivy runs twice per target</h3>
+      <p>
+        The first pass writes a full-severity report — SARIF for GitHub code scanning and
+        Azure DevOps artifacts, GitLab's own format for the merge request security widget.
+        The second pass is filtered to <code>HIGH,CRITICAL</code> and is the one that
+        fails the build. Splitting them keeps the gate actionable without hiding the long
+        tail, and the vulnerability database is cached between the two, so the second pass
+        costs little.
+      </p>
+
+      <h3>Why unfixable findings do not block</h3>
+      <p>
+        <code>ignore-unfixed: true</code> is a deliberate call. A CVE with no upstream fix
+        cannot be actioned by the team that owns the application, and blocking on it only
+        teaches people to bypass the gate. Catch those in a scheduled sweep with
+        <code>--ignore-unfixed=false</code> across the whole registry, where the platform
+        team can act on them.
+      </p>
+
+      <h3>Dismissing a finding</h3>
+      <p>
+        Put it in <code>.trivyignore</code> with an expiry and a reason. An entry without
+        one is a finding nobody owns.
+      </p>
+      <div class="code">
+        <div class="code__bar">
+          <span class="code__path">.trivyignore</span>
+          <button class="code__copy" type="button">Copy</button>
+        </div>
+        <pre><code data-lang="shell">CVE-2024-00000 exp:2026-12-31
+  No fix upstream; the affected code path is not reachable from our entrypoint.
+  Owner: platform-team. Re-checked 2026-09-08.</code></pre>
+      </div>
+    </section>
+
+    <!-- ================================================================ -->
+    <section id="supply-chain">
+      <h2>Blocking malicious packages</h2>
+
+      <p>
+        <a href="https://github.com/AikidoSec/safe-chain">Aikido Safe Chain</a> runs a
+        local proxy and routes package downloads through it, checking each one against
+        Aikido Intel. A package that is known malware — at any dependency depth — is
+        blocked before it reaches disk. It also suppresses versions published in the last
+        48 hours, which is the window where a compromised release does most of its damage.
+      </p>
+
+      <div class="note">
+        <strong>Install it in two places, not one.</strong> The runner install covers what
+        the <em>job</em> installs. It does not cover <code>npm ci</code> inside
+        <code>docker build</code> — that runs in the build container, where the runner's
+        shims do not exist. The reference Dockerfile installs Safe Chain in its build
+        stage for exactly this reason.
+      </div>
+
+      <p>
+        Both installs pin a release version and verify the installer's SHA-256. GitHub
+        release assets are immutable, so a versioned URL plus a checksum means the script
+        that runs is the script that was published.
+      </p>
+
+      <div class="code">
+        <div class="code__bar">
+          <span class="code__path">pipelines/common/Dockerfile</span>
+          <button class="code__copy" type="button">Copy</button>
+        </div>
+        <pre><code data-lang="dockerfile">{{include:pipelines/common/Dockerfile}}</code></pre>
+      </div>
+
+      <p>
+        <code>npm safe-chain-verify</code> is in the build on purpose: if the shims ever
+        stop landing ahead of the real <code>npm</code> on <code>PATH</code>, the build
+        fails loudly instead of quietly installing unchecked packages.
+      </p>
+    </section>
+
+    <!-- ================================================================ -->
+    <section id="registry">
+      <h2>Running the registry</h2>
+
+      <p>
+        The registry is one Terraform configuration built on the
+        <a href="https://registry.terraform.io/modules/Azure/avm-res-containerregistry-registry/azurerm/0.8.0">Azure
+        Verified Module for Container Registry</a>. Premium is not optional here: ABAC
+        repository permissions, geo-replication, scope maps, cache rules, IP rules and the
+        untagged-manifest retention policy are all Premium-only, and the tenancy model
+        depends on the first of those.
+      </p>
+
+      <div class="code">
+        <div class="code__bar">
+          <span class="code__path">deploy</span>
+          <button class="code__copy" type="button">Copy</button>
+        </div>
+        <pre><code data-lang="shell">cd infra/terraform
+cp terraform.tfvars.example terraform.tfvars   # then edit
+
+export ARM_SUBSCRIPTION_ID=&lt;subscription-id&gt;
+az login
+
+terraform init
+terraform plan
+terraform apply</code></pre>
+      </div>
+
+      <h3>Adding a team</h3>
+      <p>
+        One entry in <code>var.tenants</code>, then apply. The namespace, the role
+        assignments, the ABAC conditions and the pipeline identity all follow from it.
+      </p>
+      <div class="code">
+        <div class="code__bar">
+          <span class="code__path">infra/terraform/terraform.tfvars</span>
+          <button class="code__copy" type="button">Copy</button>
+        </div>
+        <pre><code data-lang="hcl">tenants = {
+  # ...existing teams...
+
+  analytics = {
+    display_name = "Analytics"
+
+    ci_identities = {
+      build = {
+        access  = "push"
+        issuer  = "https://token.actions.githubusercontent.com"
+        subject = "repo:contoso/analytics:ref:refs/heads/main"
+      }
+    }
+  }
+}</code></pre>
+      </div>
+
+      <h3>Deliberate choices</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th scope="col">Setting</th><th scope="col">Value</th><th scope="col">Why</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>admin_enabled</td>
+              <td>false</td>
+              <td>A shared username and password that bypasses every namespace boundary</td>
+            </tr>
+            <tr>
+              <td>anonymous_pull</td>
+              <td>false</td>
+              <td>Cannot be scoped per team — it would expose every repository</td>
+            </tr>
+            <tr>
+              <td>public_network_access</td>
+              <td>true</td>
+              <td>Hosted runners have no stable egress IP; authorization does the isolation</td>
+            </tr>
+            <tr>
+              <td>role_assignment_mode</td>
+              <td>AbacRepositoryPermissions</td>
+              <td>Required for per-repository scoping. Legacy AcrPull/AcrPush are not honoured in this mode</td>
+            </tr>
+            <tr>
+              <td>retention_policy_in_days</td>
+              <td>30</td>
+              <td>Untagged manifests pile up fast when every commit produces an image</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="note note--watch">
+        <strong>Switching an existing registry to ABAC mode is not a no-op.</strong>
+        Legacy <code>AcrPull</code>, <code>AcrPush</code> and <code>AcrDelete</code>
+        assignments stop being honoured, and credentials clients cached before the switch
+        are rejected with HTTP 401 until they refresh. Assign the ABAC roles without
+        conditions first, switch, force clients to refresh, then narrow the conditions.
+      </div>
+    </section>
+
+    <!-- ================================================================ -->
+    <section id="troubleshooting">
+      <h2>When it breaks</h2>
+
+      <h3 data-tool="azure-devops github gitlab">No matching federated identity record found</h3>
+
+      <div data-tool="azure-devops">
+        <p>
+          <code>AADSTS700213</code>. The service connection's subject does not match
+          <code>subject</code> in <code>terraform.tfvars</code>. Read it again from the
+          service connection page — it changes if the connection or the project is
+          renamed.
+        </p>
+      </div>
+
+      <div data-tool="github">
+        <p>
+          <code>AADSTS70021</code>. The token's subject does not match the federated
+          credential. The usual cause is building from a tag or a pull request when the
+          credential was federated on <code>ref:refs/heads/main</code>. Add an entry for
+          that subject, or federate on an environment instead.
+        </p>
+      </div>
+
+      <div data-tool="gitlab">
+        <p>
+          <code>AADSTS70021</code>. The token's subject does not match the federated
+          credential. Print what the job actually sends and compare:
+        </p>
+        <div class="code">
+          <div class="code__bar">
+            <span class="code__path">.gitlab-ci.yml</span>
+            <button class="code__copy" type="button">Copy</button>
+          </div>
+          <pre><code data-lang="shell">echo "$AZURE_ID_TOKEN" | cut -d. -f2 | base64 -d 2>/dev/null | jq '{iss, sub, aud}'</code></pre>
+        </div>
+      </div>
+
+      <h3>denied: requested access to the resource is denied</h3>
+      <p>
+        The image name is outside your namespace, or the role assignment has not
+        propagated yet. Check the first path segment of the image against
+        <code>terraform output tenant_namespaces</code>. ABAC changes usually take effect
+        within a minute or two, but a token minted before the change keeps its old
+        permissions until it expires.
+      </p>
+
+      <h3>ResourceNotFound from az acr login</h3>
+      <p>
+        Expected, and the reason the pipelines do not use <code>az acr login</code>.
+        It resolves the registry through the ARM control plane first, which needs
+        <code>Microsoft.ContainerRegistry/registries/read</code> — a permission the
+        pipeline identities deliberately do not have. The pipelines exchange the Entra
+        token for an ACR refresh token directly instead, which needs no control-plane
+        access at all.
+      </p>
+
+      <h3>unauthorized when pulling a base image</h3>
+      <p>
+        Base images must come through <code>&lt;login-server&gt;/cache/…</code>, and your
+        identity needs read access to <code>cache/</code> — which it has by default. If
+        you are pulling from <code>docker.io</code> directly, you are hitting Docker Hub's
+        anonymous rate limit rather than an authorization problem.
+      </p>
+
+      <h3>A build fails on a CVE you cannot fix</h3>
+      <p>
+        Check whether it is actually unfixable: the gate already ignores findings with no
+        available fix. If there is a fix and you cannot take it yet, add a
+        <code>.trivyignore</code> entry with an expiry date and an owner, and open the
+        work to remove it. Do not lower <code>severity</code> in your copy of
+        <code>trivy.yaml</code> — that hides the next finding too.
+      </p>
+    </section>
+
+  </main>
+
+  <footer>
+    <span>Container CI — platform engineering</span>
+    <span>Rendered from the pipeline files themselves by <code>tools/build_docs.py</code></span>
+  </footer>
+
+</div>
+
+<script src="assets/app.js"></script>
