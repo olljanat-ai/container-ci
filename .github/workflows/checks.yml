@@ -1,0 +1,111 @@
+###############################################################################
+# Repository checks. These enforce the invariants in CLAUDE.md - most
+# importantly that docs/index.html is in sync with the pipeline files it
+# documents.
+###############################################################################
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.14.4
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform -chdir=infra/terraform fmt -check -recursive -diff
+
+      - name: Validate
+        run: |
+          terraform -chdir=infra/terraform init -backend=false -input=false
+          terraform -chdir=infra/terraform validate
+
+  docs:
+    name: Docs are in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Fails when docs/index.html was not regenerated after a pipeline file or
+      # the template changed. Fix with: python3 tools/build_docs.py
+      - name: Check docs/index.html
+        run: python3 tools/build_docs.py --check
+
+  lint:
+    name: Shell and YAML
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        run: shellcheck pipelines/common/scripts/*.sh
+
+      - name: Parse every YAML file
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check pyyaml
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          import yaml
+
+          failures = []
+          for path in sorted(pathlib.Path(".").rglob("*.y*ml")):
+              if ".git" in path.parts:
+                  continue
+              try:
+                  list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
+              except yaml.YAMLError as error:
+                  failures.append(f"{path}: {error}")
+
+          for failure in failures:
+              print(failure, file=sys.stderr)
+          sys.exit(1 if failures else 0)
+          PY
+
+  trivy-policy:
+    name: Trivy policy and reference Dockerfiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Trivy
+        env:
+          TRIVY_VERSION: "0.74.0"
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" -o /tmp/trivy.tar.gz
+          tar -xzf /tmp/trivy.tar.gz -C /tmp trivy
+          sudo mv /tmp/trivy /usr/local/bin/trivy
+          trivy --version
+
+      # Run from pipelines/common because `ignorefile` in trivy.yaml is resolved
+      # relative to the working directory, not to the config file - the same way
+      # it resolves in a project repository, where both sit at the root.
+      #
+      # This both loads the shared policy, catching an unknown or misplaced key,
+      # and runs the misconfiguration scanner over the Dockerfiles teams copy.
+      - name: Scan the reference build assets
+        working-directory: pipelines/common
+        run: trivy config --config trivy.yaml --severity HIGH,CRITICAL --exit-code 1 .
