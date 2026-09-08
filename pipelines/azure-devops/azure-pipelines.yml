@@ -1,0 +1,47 @@
+###############################################################################
+# Copy this file into your project repository as azure-pipelines.yml and edit
+# the values under `parameters:` in the extends block.
+#
+# The build itself lives in the central template, so a change to the shared
+# scanning policy reaches every project without touching this file.
+###############################################################################
+trigger:
+  branches:
+    include:
+      - main
+  tags:
+    include:
+      - v*
+
+pr:
+  branches:
+    include:
+      - main
+
+resources:
+  repositories:
+    - repository: container-ci
+      type: github
+      name: olljanat-ai/container-ci
+      ref: refs/heads/main
+      endpoint: github-container-ci # GitHub service connection name
+
+extends:
+  template: pipelines/azure-devops/templates/container-build.yml@container-ci
+  parameters:
+    registry: contosocentralregistry.azurecr.io
+
+    # Must start with your tenant's namespace. Pushing outside it is denied by
+    # the ABAC condition on the pipeline identity, not just by convention.
+    image: payments/api
+
+    # ARM service connection using workload identity federation, backed by the
+    # managed identity Terraform created for this tenant.
+    azureServiceConnection: acr-push
+
+    # Optional; these are the defaults.
+    # dockerfile: Dockerfile
+    # buildContext: .
+    # trivyConfig: trivy.yaml
+    # trivySeverity: HIGH,CRITICAL
+    # defaultBranch: refs/heads/main
